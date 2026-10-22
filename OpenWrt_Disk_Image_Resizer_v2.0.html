@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenWrt 磁盘镜像扩容与重新打包工具 v2.0</title>
+<style>
+:root{color-scheme:light dark;--bg:#f5f7fb;--panel:#fff;--fg:#172033;--muted:#5b6578;--line:#d9dfeb;--accent:#245fe8;--warn:#fff4d7;--ok:#e7f8ee}
+@media(prefers-color-scheme:dark){:root{--bg:#10141c;--panel:#1a202b;--fg:#edf2fb;--muted:#a8b2c4;--line:#343d4c;--accent:#83a7ff;--warn:#3b3017;--ok:#163522}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:900px;margin:28px auto;padding:0 16px 40px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:22px;margin:16px 0;box-shadow:0 3px 14px #00000008}
+h1{font-size:26px;line-height:1.25;margin:0 0 8px}h2{font-size:18px;margin:0 0 14px}.sub,.muted{color:var(--muted)}.sub{margin:0 0 18px}
+label{display:block;font-weight:650;margin:12px 0 6px}input[type=file],input[type=number],select{width:100%;padding:11px;border:1px solid var(--line);border-radius:9px;background:var(--panel);color:var(--fg);font:inherit}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}.checks{display:flex;align-items:flex-start;gap:9px;margin:12px 0;color:var(--muted)}.checks input{margin-top:5px}
+button,.download{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:10px;padding:12px 18px;background:var(--accent);color:white;font-weight:700;font:inherit;text-decoration:none;cursor:pointer}
+button:disabled{opacity:.5;cursor:not-allowed}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}#downloadArea{flex-direction:column;align-items:flex-start}.secondary{background:transparent;color:var(--fg);border:1px solid var(--line)}
+#status{white-space:pre-wrap;margin-top:14px;padding:12px;border-radius:10px;background:var(--bg);min-height:44px}.warn{background:var(--warn);padding:12px 14px;border-radius:10px}.ok{background:var(--ok)}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.stat{padding:12px;border:1px solid var(--line);border-radius:10px;overflow-wrap:anywhere}.stat b{display:block;font-size:18px}.small{font-size:13px;color:var(--muted)}code{overflow-wrap:anywhere}
+progress{width:100%;height:12px;margin-top:12px;display:none}
+@media(max-width:620px){.row,.stats{grid-template-columns:1fr}main{margin:16px auto}.panel{padding:16px}h1{font-size:22px}}
+</style>
+</head>
+<body>
+<main>
+  <h1>OpenWrt 磁盘镜像扩容工具</h1>
+  <p class="sub">本地浏览器处理文件：选择磁盘镜像、输入目标容量、生成新的镜像并下载。文件不会上传到服务器。</p>
+  <div class="panel">
+    <h2>1. 选择固件镜像</h2>
+    <label for="file">输入文件（支持 .img、.img.gz、原始磁盘镜像 .bin）</label>
+    <input id="file" type="file" accept=".img,.gz,.bin,.raw,.img.gz,application/gzip,application/octet-stream">
+    <div class="small" id="fileInfo">建议使用 combined / combined-efi 这类整盘镜像。单独的 sysupgrade、factory、rootfs 包通常不是整盘镜像，不能直接按磁盘容量扩容。</div>
+    <div class="row">
+      <div>
+        <label for="size">目标磁盘容量</label>
+        <input id="size" type="number" min="16" max="65536" step="1" value="1024">
+      </div>
+      <div>
+        <label for="unit">容量单位</label>
+        <select id="unit"><option value="MiB">MiB</option></select>
+      </div>
+    </div>
+    <label class="checks"><input id="extend" type="checkbox" checked><span>扩展分区表中结束位置最靠后的分区（GPT 会同步更新主/备份表和 CRC；MBR 更新分区结束位置）。</span></label>
+    <p class="small">输出固定为同时生成 5 个文件：扩容后的 .img.gz 压缩包、扩容后的 VMware ESXi 两件套（.vmdk 描述文件 + -flat.vmdk 数据文件），以及未扩容（原始大小）的 ESXi 两件套。</p>
+    <div class="warn"><b>重要：</b>扩展磁盘镜像和分区边界不等于扩展文件系统或 OpenWrt 可写 overlay。此工具不会重新编译固件，也不会扩展 SquashFS；不同固件布局可能需要在设备首次启动后单独调整可写分区。处理前请备份原文件。</div>
+    <div class="actions">
+      <button id="run" disabled>扩容并生成文件</button>
+      <button id="reset" class="secondary" type="button">重置</button>
+    </div>
+    <progress id="progress" max="100" value="0"></progress>
+    <div id="status" role="status">请选择一个镜像文件。</div>
+  </div>
+  <div class="panel">
+    <h2>2. 处理结果</h2>
+    <div class="stats">
+      <div class="stat"><span class="small">输入文件大小</span><b id="inSize">—</b></div>
+      <div class="stat"><span class="small">原始镜像大小 → 目标镜像大小</span><b><span id="origSize">—</span> → <span id="outSize">—</span></b></div>
+      <div class="stat"><span class="small">分区表识别</span><b id="layout">—</b></div>
+    </div>
+    <div class="actions" id="downloadArea"></div>
+    <p class="small">工具会检查 GPT 的基础结构和校验值，并在输出前验证新镜像长度。请在实际设备/虚拟机上测试后再替换原固件。</p>
+  </div>
+  <div class="panel">
+    <h2>支持范围与限制</h2>
+    <ul>
+      <li>支持原始整盘镜像，以及可由浏览器解压的 GZIP 整盘镜像。</li>
+      <li>支持标准 GPT 磁盘镜像；也尝试支持标准 MBR 分区表。</li>
+      <li>不支持直接把任意 .apk、.ipk、sysupgrade 或 rootfs 分区包变成整盘镜像。</li>
+      <li>浏览器需要支持 <code>DecompressionStream</code> / <code>CompressionStream</code>（新版 Chrome、Edge 通常支持）。大型镜像会占用较多内存，建议使用 64 位浏览器。</li>
+      <li>VMDK 输出为 ESXi 原生两件套（.vmdk 描述文件 createType="vmfs" + 同名 -flat.vmdk 数据文件，非稀疏），一次生成扩容后（带 -resized）和未扩容（原始大小）两套。每套的两个文件须放在一起上传到 ESXi 数据存储的同一目录，给虚拟机添加现有硬盘时选 .vmdk 描述文件。描述符 adapterType 为 lsilogic。</li>
+      <li>扩容分区不保证扩容文件系统。工具会尽量保留镜像原始内容，只修改镜像长度和分区元数据。</li>
+    </ul>
+  </div>
+</main>
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const fileInput=$('file'), runBtn=$('run'), status=$('status'), progress=$('progress');
+let selected=null, prepared=null;
+const flowState={resize:{urls:[],links:[]}};
+const fmt = n => {
+  if(!Number.isFinite(n)) return '—';
+  const units=['B','KiB','MiB']; let i=0;
+  while(n>=1024 && i<units.length-1){n/=1024;i++;}
+  return `${n.toFixed(i===0?0:2)} ${units[i]}`;
+};
+function say(s, ok=false){status.textContent=s;status.className=ok?'ok':'';}
+function setProgress(v){progress.style.display='block';progress.value=v;}
+function clearFlow(flow){const st=flowState[flow];for(const u of st.urls)URL.revokeObjectURL(u);for(const el of st.links)el.remove();st.urls=[];st.links=[];}
+function clearDownload(){clearFlow('resize');}
+function addDownloads(flow,items){clearFlow(flow);const st=flowState[flow];for(const it of items){if(it.label){const d=document.createElement('div');d.textContent=it.label;d.style.cssText='flex:0 0 100%;font-weight:650;margin-top:10px';$('downloadArea').appendChild(d);st.links.push(d);continue;}const u=URL.createObjectURL(it.blob);st.urls.push(u);const a=document.createElement('a');a.className='download';a.href=u;a.download=it.name;a.textContent=`下载 ${it.name}`;$('downloadArea').appendChild(a);st.links.push(a);}}
+function u32(v){return v>>>0;}
+function readU32(d,o){return d.getUint32(o,true);}
+function readU64(d,o){const n=d.getBigUint64(o,true);if(n>BigInt(Number.MAX_SAFE_INTEGER))throw Error('分区 LBA 超出浏览器安全整数范围。');return Number(n);}
+function writeU64(d,o,n){d.setBigUint64(o,BigInt(n),true);}
+const CRC32_TABLE=(()=>{const t=new Uint32Array(256);for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=(c&1)?(0xedb88320^(c>>>1)):(c>>>1);t[n]=c>>>0;}return t;})();
+function crc32(bytes,prev){
+  let c=((prev||0)^0xffffffff)>>>0;
+  for(let i=0;i<bytes.length;i++)c=CRC32_TABLE[(c^bytes[i])&0xff]^(c>>>8);
+  return (c^0xffffffff)>>>0;
+}
+async function streamTransform(blob, format, mode){
+  const C=mode==='decompress'?DecompressionStream:CompressionStream;
+  if(typeof C==='undefined')throw Error(`此浏览器不支持 ${mode==='decompress'?'GZIP 解压':'GZIP 压缩'} API，请使用新版 Chrome 或 Edge。`);
+  const stream=blob.stream().pipeThrough(new C(format));
+  return await new Response(stream).blob();
+}
+function buildHuffman(lengths){
+  const counts=new Array(16).fill(0);
+  for(const l of lengths)counts[l]++;
+  counts[0]=0;
+  const offs=new Array(16).fill(0);
+  for(let i=1;i<16;i++)offs[i]=offs[i-1]+counts[i-1];
+  const symbols=new Array(lengths.length);
+  for(let s=0;s<lengths.length;s++)if(lengths[s])symbols[offs[lengths[s]]++]=s;
+  return{counts,symbols};
+}
+function huffDecode(h,bit){
+  let code=0,first=0,index=0;
+  for(let len=1;len<=15;len++){
+    code|=bit();
+    const count=h.counts[len];
+    if(code-first<count)return h.symbols[index+code-first];
+    index+=count;first=(first+count)<<1;code<<=1;
+  }
+  throw Error('解压数据损坏（无效的 Huffman 编码）。');
+}
+function inflateRawBlocks(data,start,emit){
+  // 纯 JS inflate（RFC 1951）：解出的数据按 4 MiB 分块交给 emit（调用方攒入 Blob），不整份留内存；
+  // 块间保留最近 32 KiB 历史供距离回引用。停在 deflate 流结束处，返回消耗字节数。
+  const LEN_BASE=[3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+  const LEN_EXT=[0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+  const DIST_BASE=[1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+  const DIST_EXT=[0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+  let pos=start,bitbuf=0,bitcnt=0;
+  function fill(){while(bitcnt<15&&pos<data.length){bitbuf|=data[pos++]<<bitcnt;bitcnt+=8;}}
+  function bits(n){if(n===0)return 0;fill();const v=bitbuf&((1<<n)-1);bitbuf>>>=n;bitcnt-=n;return v;}
+  const bit=()=>bits(1);
+  const BLOCK=4*1024*1024,HIST=32768;
+  let cur=new Uint8Array(BLOCK),len=0,flushed=0,prevTail=new Uint8Array(0);
+  function flush(){
+    if(len===0)return;
+    const block=cur.subarray(0,len);
+    emit(block);
+    if(block.byteLength>=HIST)prevTail=block.subarray(block.byteLength-HIST);
+    else{
+      const keep=Math.min(HIST,prevTail.byteLength+block.byteLength);
+      const merged=new Uint8Array(keep),kp=keep-block.byteLength;
+      if(kp>0)merged.set(prevTail.subarray(prevTail.byteLength-kp),0);
+      merged.set(block,kp);prevTail=merged;
+    }
+    flushed+=len;len=0;cur=new Uint8Array(BLOCK);
+  }
+  function putByte(b){cur[len++]=b;if(len===BLOCK)flush();}
+  function histByte(absPos){
+    if(absPos>=flushed)return cur[absPos-flushed];
+    return prevTail[absPos-(flushed-prevTail.byteLength)];
+  }
+  let final=false;
+  while(!final){
+    final=bits(1)===1;
+    const type=bits(2);
+    if(type===0){
+      const drop=bitcnt%8;if(drop)bits(drop);
+      const ln=bits(8)|(bits(8)<<8), nln=bits(8)|(bits(8)<<8);
+      if(((ln^nln)&0xffff)!==0xffff)throw Error('解压数据损坏（stored 块校验失败）。');
+      for(let i=0;i<ln;i++)putByte(bits(8));
+    }else{
+      let litH,distH;
+      if(type===1){
+        const ll=new Array(288);for(let i=0;i<288;i++)ll[i]=i<144?8:i<256?9:i<280?7:8;
+        litH=buildHuffman(ll);distH=buildHuffman(new Array(32).fill(5));
+      }else if(type===2){
+        const hlit=bits(5)+257,hdist=bits(5)+1,hclen=bits(4)+4;
+        const order=[16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+        const cl=new Array(19).fill(0);
+        for(let i=0;i<hclen;i++)cl[order[i]]=bits(3);
+        const clH=buildHuffman(cl);
+        const total=hlit+hdist,lens=new Array(total);let i=0;
+        while(i<total){
+          const s=huffDecode(clH,bit);
+          if(s<16)lens[i++]=s;
+          else if(s===16){const prev=lens[i-1];let r=3+bits(2);while(r--)lens[i++]=prev;}
+          else if(s===17){let r=3+bits(3);while(r--)lens[i++]=0;}
+          else{let r=11+bits(7);while(r--)lens[i++]=0;}
+        }
+        litH=buildHuffman(lens.slice(0,hlit));distH=buildHuffman(lens.slice(hlit));
+      }else throw Error('解压数据损坏（保留的块类型）。');
+      for(;;){
+        const sym=huffDecode(litH,bit);
+        if(sym<256)putByte(sym);
+        else if(sym===256)break;
+        else{
+          const li=sym-257;if(li>=29)throw Error('解压数据损坏（长度码越界）。');
+          const length=LEN_BASE[li]+bits(LEN_EXT[li]);
+          const dsym=huffDecode(distH,bit);
+          if(dsym>=30)throw Error('解压数据损坏（距离码越界）。');
+          const dist=DIST_BASE[dsym]+bits(DIST_EXT[dsym]);
+          if(dist>flushed+len)throw Error('解压数据损坏（距离超出已解出长度）。');
+          for(let k=0;k<length;k++){const b=histByte(flushed+len-dist);cur[len++]=b;if(len===BLOCK)flush();}
+        }
+      }
+    }
+  }
+  flush();
+  const bitsUsed=(pos-start)*8-bitcnt;
+  return{bytesUsed:Math.ceil(bitsUsed/8)};
+}
+function gunzipManual(buf){
+  // 手工解析 gzip 成员（可多段），逐段 inflate 并校验 CRC 与长度；解出数据以分块字节形式返回
+  // （调用方缓存这些块，重置时可逐块分离立即释放内存）；成员之后的非 gzip 字节（签名等）计入 ignored。
+  const blocks=[];let members=0,totalLen=0,off=0;
+  // 解压器吐出的 4 MiB 小块先攒成约 64 MiB 的大块再缓存：大块内存在浏览器中是独立映射，重置分离时能像整块大内存一样立即归还。
+  let pend=[],pendBytes=0;
+  const pendFlush=(force)=>{
+    if(!pend.length)return;
+    if(pendBytes<64*1024*1024&&!force)return;
+    if(pend.length===1)blocks.push(pend[0]);
+    else{const b=new Uint8Array(pendBytes);let o=0;for(const p of pend){b.set(p,o);o+=p.byteLength;}blocks.push(b);}
+    pend=[];pendBytes=0;
+  };
+  while(off+18<=buf.length&&buf[off]===0x1f&&buf[off+1]===0x8b){
+    if(buf[off+2]!==8)break;
+    const flg=buf[off+3];let p=off+10;
+    if(flg&4){if(p+2>buf.length)break;const x=buf[p]|(buf[p+1]<<8);p+=2+x;}
+    if(flg&8){while(p<buf.length&&buf[p])p++;p++;}
+    if(flg&16){while(p<buf.length&&buf[p])p++;p++;}
+    if(flg&2)p+=2;
+    if(p>buf.length)break;
+    let memberCrc=0,memberLen=0;
+    const r=inflateRawBlocks(buf,p,(block)=>{
+      memberCrc=crc32(block,memberCrc);
+      memberLen+=block.byteLength;
+      pend.push(block);pendBytes+=block.byteLength;pendFlush(false);
+    });
+    const end=p+r.bytesUsed;
+    if(end+8>buf.length)throw Error('gzip 数据不完整（缺少尾部校验）。');
+    const storedCrc=(buf[end]|(buf[end+1]<<8)|(buf[end+2]<<16)|(buf[end+3]<<24))>>>0;
+    const isize=(buf[end+4]|(buf[end+5]<<8)|(buf[end+6]<<16)|(buf[end+7]<<24))>>>0;
+    if(isize!==(memberLen>>>0))throw Error('gzip 校验失败（解压长度不符）。');
+    if(memberCrc!==storedCrc)throw Error('gzip 校验失败（CRC 不符）。');
+    members++;totalLen+=memberLen;off=end+8;
+  }
+  if(!members)throw Error('无法解析 gzip 数据（文件可能已损坏）。');
+  pendFlush(true);
+  return{blocks,size:totalLen,ignored:buf.length-off};
+}
+function prefixBytes(blocks,n){
+  let total=0;for(const b of blocks){total+=b.byteLength;if(total>=n)break;}
+  const out=new Uint8Array(Math.min(n,total));let o=0;
+  for(const b of blocks){if(o>=out.byteLength)break;const k=Math.min(b.byteLength,out.byteLength-o);out.set(b.subarray(0,k),o);o+=k;}
+  return out;
+}
+function gptDeclaredSizeFromHead(head){
+  if(head.byteLength<1040)return null;
+  if(!(head[512]===0x45&&head[513]===0x46&&head[514]===0x49&&head[515]===0x20&&head[516]===0x50&&head[517]===0x41&&head[518]===0x52&&head[519]===0x54))return null;
+  const dv=new DataView(head.buffer,head.byteOffset,head.byteLength);
+  return (readU64(dv,512+32)+1)*512;
+}
+async function trailerIsize(blob){
+  if(blob.size<18)return null;
+  const tail=new Uint8Array(await blob.slice(blob.size-8).arrayBuffer());
+  return (tail[4]|(tail[5]<<8)|(tail[6]<<16)|(tail[7]<<24))>>>0;
+}
+async function decompressToBlocks(blob){
+  // 解压 .gz 为分块字节（每块约 8 MiB，处理时再拼成 Blob 流式使用；缓存这些块可在重置时逐块分离、立即释放内存）。
+  // 解压结果必须通过完整性校验才接受——旧版曾把原生解压的半成品当成品（多段 gzip 只解出第一段、或中途出错后抢救了残缺数据）。
+  // 1) 原生解压：GPT 镜像核对表头声明的磁盘总大小；其他镜像核对 gzip 尾部 ISIZE；原生报错时仅当 GPT 声明大小吻合才抢救。
+  // 2) 校验不过或无法抢救：用内置纯 JS 解压器逐成员解压并校验 CRC/ISIZE，结果权威。
+  if(typeof DecompressionStream!=='undefined'){
+    const blocks=[];let parts=[],partsBytes=0,total=0,err=null;
+    const merge=()=>{if(!parts.length)return;if(parts.length===1)blocks.push(parts[0]);else{const b=new Uint8Array(partsBytes);let o=0;for(const p of parts){b.set(p,o);o+=p.byteLength;}blocks.push(b);}parts=[];partsBytes=0;};
+    try{
+      const reader=blob.stream().pipeThrough(new DecompressionStream('gzip')).getReader();
+      try{for(;;){const{done,value}=await reader.read();if(done)break;parts.push(value);partsBytes+=value.byteLength;total+=value.byteLength;if(partsBytes>=64*1024*1024)merge();}}
+      catch(e){err=e;}
+    }catch(e){err=e;}
+    merge();
+    if(total>0){
+      const declared=gptDeclaredSizeFromHead(prefixBytes(blocks,1048576));
+      if(declared!==null){
+        // 声明大小 ≤ 已解出大小才算完整（官方镜像文件尾部常有填充，声明会略小于实际）；解出比声明还少 = 被截断。
+        if(total>=declared)return{blocks,size:total,trailingIgnored:!!err};
+      }else if(!err){
+        const isize=await trailerIsize(blob);
+        if(isize!==null&&(total%4294967296)===isize)return{blocks,size:total,trailingIgnored:false};
+        if(isize===null){
+          const head=prefixBytes(blocks,512);
+          if(head.byteLength>=512&&head[510]===0x55&&head[511]===0xaa)return{blocks,size:total,trailingIgnored:false};
+        }
+      }
+    }
+  }
+  await new Promise(r=>setTimeout(r,30));
+  const buf=new Uint8Array(await blob.arrayBuffer());
+  const m=gunzipManual(buf);
+  return{blocks:m.blocks,size:m.size,trailingIgnored:m.ignored>0};
+}
+function getTargetBytes(){
+  const n=Number($('size').value);if(!Number.isFinite(n)||n<=0)throw Error('请输入有效的目标容量。');
+  let bytes=n*1024**2;
+  bytes=Math.floor(bytes/512)*512;
+  if(bytes<16*1024*1024)throw Error('目标容量至少为 16 MiB。');
+  if(!Number.isSafeInteger(bytes))throw Error('目标容量超出浏览器可安全处理的范围。');
+  return bytes;
+}
+let ZERO_CHUNK=null;
+function zeroParts(parts,n){
+  if(n<=0)return;
+  if(!ZERO_CHUNK)ZERO_CHUNK=new Uint8Array(8*1024*1024);
+  while(n>0){const k=Math.min(n,ZERO_CHUNK.byteLength);parts.push(k===ZERO_CHUNK.byteLength?ZERO_CHUNK:ZERO_CHUNK.subarray(0,k));n-=k;}
+}
+async function countStreamBytes(stream){
+  const reader=stream.getReader();let total=0;
+  for(;;){const{done,value}=await reader.read();if(done)break;total+=value.byteLength;}
+  return total;
+}
+async function planResizeBlob(blob, targetBytes, extend) {
+  // 流式拼装：只读改头部/尾部的小块区域，中间段以 Blob 切片引用原镜像（不复制），再加补零段拼成结果 Blob。
+  // 同时校验镜像完整性：GPT 声明的磁盘大小必须与实际大小一致、分区不得超出实际范围——防止残缺镜像被当成完整镜像处理。
+  const size=blob.size;
+  if(size%512!==0) throw Error('输入镜像长度不是 512 字节扇区的整数倍，可能不是整盘镜像。');
+  if(targetBytes<size) throw Error('目标容量小于当前解压后镜像大小，不能缩小镜像。');
+  const oldSectors=size/512, newSectors=targetBytes/512;
+  const head0=new Uint8Array(await blob.slice(0,Math.min(size,1048576)).arrayBuffer());
+  if(head0[510]!==0x55||head0[511]!==0xaa) throw Error('未找到有效的 MBR 签名（55 AA）。文件可能是分区包而非整盘镜像。');
+  const isGPT=head0[512]===0x45&&head0[513]===0x46&&head0[514]===0x49&&head0[515]===0x20&&head0[516]===0x50&&head0[517]===0x41&&head0[518]===0x52&&head0[519]===0x54;
+  if(isGPT){
+    const h=512;
+    const d0=new DataView(head0.buffer,head0.byteOffset,head0.byteLength);
+    const hsize=readU32(d0,h+12);
+    if(hsize<92||hsize>512)throw Error('GPT 主表头大小异常。');
+    const entryLba=readU64(d0,h+72), count=readU32(d0,h+80), esize=readU32(d0,h+84);
+    if(count<1||count>4096||esize<128||esize>1024)throw Error('GPT 分区条目参数异常。');
+    const entriesLen=count*esize, entriesOff=entryLba*512;
+    if(entriesOff+entriesLen>size)throw Error('GPT 分区条目数组超出输入镜像范围。');
+    let region=head0;
+    if(entriesOff+entriesLen>region.byteLength)region=new Uint8Array(await blob.slice(0,entriesOff+entriesLen).arrayBuffer());
+    const d=new DataView(region.buffer,region.byteOffset,region.byteLength);
+    if(readU64(d,h+32)+1>oldSectors)throw Error('GPT 声明的磁盘大小超过镜像实际大小，镜像可能不完整或已损坏。');
+    if(crc32(region.subarray(entriesOff,entriesOff+entriesLen))!==readU32(d,h+88))throw Error('GPT 分区条目 CRC 校验失败；为避免损坏镜像，已停止处理。');
+    const partList=[];
+    for(let i=0;i<count;i++){
+      const o=entriesOff+i*esize;
+      let nonzero=false;for(let j=0;j<16;j++)if(region[o+j]){nonzero=true;break;}
+      if(!nonzero)continue;
+      const first=readU64(d,o+32), last=readU64(d,o+40);
+      if(last<first)throw Error(`GPT 第 ${i+1} 个分区的起止 LBA 无效。`);
+      partList.push({index:i,off:o,first,last});
+    }
+    if(!partList.length)throw Error('GPT 中没有找到有效分区。');
+    const lastPart=partList.reduce((a,b)=>a.last>b.last?a:b);
+    if(lastPart.last>=oldSectors)throw Error('最后一个分区超出镜像实际范围，镜像可能不完整。');
+    const backupEntriesLba=newSectors-33, lastUsable=newSectors-34, backupHeaderLba=newSectors-1;
+    if(extend&&lastPart.first>lastUsable)throw Error('目标磁盘太小，无法容纳最后一个分区。');
+    const headLen=entriesOff+entriesLen;
+    const head=new Uint8Array(region.subarray(0,headLen));
+    const hd=new DataView(head.buffer);
+    if(extend)writeU64(hd,lastPart.off+40,lastUsable);
+    hd.setUint32(446+12,Math.min(newSectors-1,0xffffffff),true);
+    writeU64(hd,h+32,backupHeaderLba);
+    writeU64(hd,h+40,34);
+    writeU64(hd,h+48,lastUsable);
+    hd.setUint32(h+88,crc32(head.subarray(entriesOff,entriesOff+entriesLen)),true);
+    hd.setUint32(h+16,0,true);
+    hd.setUint32(h+16,crc32(head.subarray(h,h+hsize)),true);
+    const tailLen=33*512, backupOff=32*512;
+    const tail=new Uint8Array(tailLen);
+    tail.set(head.subarray(entriesOff,entriesOff+entriesLen),0);
+    tail.set(head.subarray(h,h+512),backupOff);
+    const td=new DataView(tail.buffer);
+    writeU64(td,backupOff+24,backupHeaderLba);
+    writeU64(td,backupOff+32,1);
+    writeU64(td,backupOff+40,34);
+    writeU64(td,backupOff+48,lastUsable);
+    writeU64(td,backupOff+72,backupEntriesLba);
+    td.setUint32(backupOff+88,crc32(tail.subarray(0,entriesLen)),true);
+    td.setUint32(backupOff+16,0,true);
+    td.setUint32(backupOff+16,crc32(tail.subarray(backupOff,backupOff+hsize)),true);
+    const bodyEnd=Math.min(size,targetBytes-tailLen);
+    const parts=[head,blob.slice(headLen,bodyEnd)];
+    zeroParts(parts,targetBytes-tailLen-bodyEnd);
+    parts.push(tail);
+    return {blob:new Blob(parts,{type:'application/octet-stream'}),layout:'GPT',oldSectors,newSectors};
+  }
+  const d=new DataView(head0.buffer,head0.byteOffset,head0.byteLength);
+  const mp=[];
+  for(let i=0;i<4;i++){
+    const o=446+i*16, type=head0[o+4], start=readU32(d,o+8), len=readU32(d,o+12);
+    if(type!==0&&len>0)mp.push({off:o,start,end:start+len-1,type});
+  }
+  if(!mp.length)throw Error('未找到 GPT 或有效的 MBR 分区条目。');
+  const last=mp.reduce((a,b)=>a.end>b.end?a:b);
+  if(last.end>=oldSectors)throw Error('最后一个分区超出镜像实际范围，镜像可能不完整。');
+  const head=new Uint8Array(head0.subarray(0,512));
+  const hd=new DataView(head.buffer);
+  if(extend){
+    if(last.start>=newSectors)throw Error('目标容量太小，无法容纳最后一个分区。');
+    hd.setUint32(last.off+12,Math.min(newSectors-1-last.start,0xffffffff),true);
+  }
+  hd.setUint32(446+12,Math.min(newSectors-1,0xffffffff),true);
+  const parts=[head,blob.slice(512)];
+  zeroParts(parts,targetBytes-size);
+  return {blob:new Blob(parts,{type:'application/octet-stream'}),layout:'MBR（分区结束位置已更新；扩展分区/逻辑分区布局请谨慎验证）',oldSectors,newSectors};
+}
+function buildVMDKDescriptor(capacity, flatName){
+  // ESXi 原生描述文件（createType="vmfs"），与同名 -flat.vmdk 数据文件成对使用；数据文件即扩容后的原始镜像。
+  const hex=n=>{let s='';for(let i=0;i<n;i++)s+='0123456789abcdef'[Math.floor(Math.random()*16)];return s;};
+  const cid=hex(8), lcid=hex(32);
+  const ub=[];for(let i=0;i<16;i++)ub.push(Math.floor(Math.random()*256).toString(16).padStart(2,'0').toUpperCase());
+  const uuid=ub.slice(0,8).join(' ')+'-'+ub.slice(8).join(' ');
+  const cyl=Math.max(1,Math.floor(capacity/(255*63)));
+  return '# Disk DescriptorFile\nversion=1\nencoding="UTF-8"\nCID='+cid+'\nparentCID=ffffffff\ncreateType="vmfs"\n\n# Extent description\nRW '+capacity+' VMFS "'+flatName+'"\n\n# The Disk Data Base \n#DDB\n\nddb.adapterType = "lsilogic"\nddb.geometry.cylinders = "'+cyl+'"\nddb.geometry.heads = "255"\nddb.geometry.sectors = "63"\nddb.longContentID = "'+lcid+'"\nddb.uuid = "'+uuid+'"\nddb.virtualHWVersion = "7"\n';
+}
+function baseName(name){return name.replace(/\.gz$/i,'').replace(/\.(img|bin|raw)$/i,'');}
+function releasePrepared(){
+  // 缓存的解压数据以分块字节保存在内存中：逐块分离其 ArrayBuffer 立即归还内存（不等浏览器回收 Blob 存储），再断开引用。
+  if(prepared&&prepared.blocks){
+    for(const b of prepared.blocks){try{b.buffer?.transfer?.();}catch(_){/* 已分离或不支持 transfer 时靠 GC 回收 */}}
+  }
+  prepared=null;
+}
+function sniffLayout(u8){
+  if(u8.byteLength>=520&&u8[510]===0x55&&u8[511]===0xaa){
+    return (u8[512]===0x45&&u8[513]===0x46&&u8[514]===0x49&&u8[515]===0x20&&u8[516]===0x50&&u8[517]===0x41&&u8[518]===0x52&&u8[519]===0x54)?'GPT':'MBR';
+  }
+  return '未识别';
+}
+fileInput.addEventListener('change',async()=>{
+  selected=fileInput.files?.[0]||null;clearDownload();releasePrepared();
+  runBtn.disabled=!selected;
+  $('inSize').textContent=selected?fmt(selected.size):'—';
+  $('origSize').textContent='—';$('outSize').textContent='—';$('layout').textContent='—';
+  $('fileInfo').textContent=selected?`${selected.name} · ${fmt(selected.size)} · ${/\.gz$/i.test(selected.name)?'检测到 GZIP 压缩扩展名':'按原始镜像读取'}`:'建议使用 combined / combined-efi 这类整盘镜像。';
+  say(selected?'已选择文件。设置目标容量后点击“扩容并生成文件”。':'请选择一个镜像文件。');
+  if(!selected)return;
+  const myFile=selected;
+  $('origSize').textContent='读取中…';$('layout').textContent='读取中…';
+  try{
+    if(/\.gz$/i.test(myFile.name)){
+      const g=await decompressToBlocks(myFile);
+      if(selected!==myFile)return;
+      prepared={file:myFile,blocks:g.blocks,size:g.size,gzNote:g.trailingIgnored?'\n注意：输入 .gz 尾部带有非 gzip 数据（如签名注释），已自动忽略，镜像主体完整。':''};
+      $('origSize').textContent=fmt(g.size);
+      $('layout').textContent=sniffLayout(prefixBytes(g.blocks,1048576));
+    }else{
+      prepared={file:myFile,blocks:null,size:myFile.size,gzNote:''};
+      $('origSize').textContent=fmt(myFile.size);
+      const head=new Uint8Array(await myFile.slice(0,1048576).arrayBuffer());
+      if(selected!==myFile)return;
+      $('layout').textContent=sniffLayout(head);
+    }
+  }catch(e){
+    if(selected!==myFile)return;
+    $('origSize').textContent='—';$('layout').textContent='读取失败';
+    const em=e?.message||String(e);
+    say(/allocation|memory/i.test(em)?'已选择文件，但读取原始信息失败：浏览器内存不足。可关闭其他标签页后重新选择，或直接点击“扩容并生成文件”尝试处理。':'已选择文件，但读取原始信息失败：'+em);
+  }
+});
+$('reset').addEventListener('click',()=>{
+  selected=null;releasePrepared();fileInput.value='';runBtn.disabled=true;clearDownload();
+  $('inSize').textContent='—';$('origSize').textContent='—';$('outSize').textContent='—';$('layout').textContent='—';
+  progress.style.display='none';say('请选择一个镜像文件。');
+});
+runBtn.addEventListener('click',async()=>{
+  if(!selected)return;
+  runBtn.disabled=true;clearFlow('resize');setProgress(5);
+  try{
+    const target=getTargetBytes();
+    say('读取文件中……');
+    let inputBlob, gzNote='';
+    const isGz=/\.gz$/i.test(selected.name);
+    if(prepared&&prepared.file===selected){
+      gzNote=prepared.gzNote;
+      inputBlob=prepared.blocks?new Blob(prepared.blocks,{type:'application/octet-stream'}):selected;
+      setProgress(40);
+    }else if(isGz){
+      const g=await decompressToBlocks(selected);
+      prepared={file:selected,blocks:g.blocks,size:g.size,gzNote:g.trailingIgnored?'\n注意：输入 .gz 尾部带有非 gzip 数据（如签名注释），已自动忽略，镜像主体完整。':''};
+      gzNote=prepared.gzNote;
+      inputBlob=new Blob(g.blocks,{type:'application/octet-stream'});
+      setProgress(40);
+    }else{
+      inputBlob=selected;setProgress(40);
+    }
+    if(inputBlob.size%512!==0)throw Error('解压后的数据不是标准扇区对齐的磁盘镜像。');
+    if(target<inputBlob.size)throw Error(`目标容量 ${fmt(target)} 小于当前镜像 ${fmt(inputBlob.size)}。`);
+    if(target>2*1024**3 && !confirm(`目标镜像为 ${fmt(target)}。生成的文件较大（约等于目标容量），请确认磁盘空间充足。继续吗？`))throw Error('已取消操作。');
+    say(`分析分区表并扩容：${fmt(inputBlob.size)} → ${fmt(target)}……`);
+    $('origSize').textContent=fmt(inputBlob.size);
+    const r=await planResizeBlob(inputBlob,target,$('extend').checked);
+    $('layout').textContent=r.layout;$('outSize').textContent=fmt(target);
+    const baseOut=baseName(selected.name)+`-${Math.round(target/1024**2)}MiB-resized`;
+    say('分区表更新完成，正在同时生成 img.gz 与 VMDK……');setProgress(65);
+    const gzName=baseOut+'.img.gz', descName=baseOut+'.vmdk', flatName=baseOut+'-flat.vmdk';
+    const rawBase=baseName(selected.name), rawDescName=rawBase+'.vmdk', rawFlatName=rawBase+'-flat.vmdk';
+    const gzBlob=await streamTransform(r.blob,'gzip','compress');
+    const descText=buildVMDKDescriptor(target/512,flatName);
+    const rawDescText=buildVMDKDescriptor(inputBlob.size/512,rawFlatName);
+    const files=[{blob:gzBlob,name:gzName},{blob:new Blob([descText],{type:'text/plain'}),name:descName},{blob:r.blob,name:flatName},{blob:new Blob([rawDescText],{type:'text/plain'}),name:rawDescName},{blob:inputBlob,name:rawFlatName}];
+    const filename=files.map(f=>f.name).join(' + ');
+    setProgress(95);
+    {
+      if(typeof DecompressionStream==='undefined')throw Error('此浏览器不支持 GZIP 解压 API，无法校验输出。');
+      const counted=await countStreamBytes(files[0].blob.stream().pipeThrough(new DecompressionStream('gzip')));
+      if(counted!==target)throw Error('输出 GZIP 校验失败：解压后长度与目标容量不一致。');
+      if(files[2].blob.size!==target)throw Error('输出 VMDK 校验失败：扩容后 -flat 数据文件长度与目标容量不一致。');
+      const dt=await files[1].blob.text();
+      if(!dt.includes('createType="vmfs"')||!dt.includes('"'+files[2].name+'"'))throw Error('输出 VMDK 校验失败：扩容后描述文件内容不正确。');
+      if(files[4].blob.size!==inputBlob.size)throw Error('输出 VMDK 校验失败：未扩容 -flat 数据文件长度与原始镜像不一致。');
+      const rdt=await files[3].blob.text();
+      if(!rdt.includes('createType="vmfs"')||!rdt.includes('"'+files[4].name+'"'))throw Error('输出 VMDK 校验失败：未扩容描述文件内容不正确。');
+    }
+    addDownloads('resize',[{label:'原始版下载'},files[3],files[4],{label:'扩容版下载'},files[0],files[1],files[2]]);
+    setProgress(100);
+    say(`处理完成。\n输出文件：${filename}\n磁盘镜像：${fmt(target)}\n分区表：${r.layout}${gzNote}\n输出文件大小：${fmt(files.reduce((s,f)=>s+f.blob.size,0))}${'\n\nVMDK 用法：共两套——带 -resized 的是扩容后版本，不带的是未扩容（原始大小）版本。每套的 .vmdk 描述文件和 -flat.vmdk 数据文件必须放在一起，上传到 ESXi 数据存储的同一目录，添加硬盘时选 .vmdk 描述文件即可挂载。注意 -flat 文件是完整大小（非稀疏）。'}\n\n请先在测试设备/虚拟机验证。该工具不会扩展 SquashFS 或保证 overlay 可写空间同步增长。`,true);
+  }catch(e){say('处理失败：'+(e?.message||String(e)));setProgress(0);}
+  finally{runBtn.disabled=!selected;}
+});
+
+})();
+</script>
+</body>
+</html>
